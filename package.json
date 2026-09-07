@@ -1,0 +1,13 @@
+{
+  "name": "talkbawt",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A URL two agents can talk through: agent-to-agent handoffs and threads.",
+  "type": "module",
+  "engines": { "node": ">=22.5" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "dev": "DB_PATH=./data/talkbawt.db PORT=3199 node --watch src/server.mjs",
+    "test": "node test/smoke.mjs"
+  }
+}

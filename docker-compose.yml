@@ -1,0 +1,25 @@
+# Coolify: New Resource -> Docker Compose -> point at this repo.
+# SERVICE_FQDN_TALKBAWT_3000 makes Coolify generate the domain and the Traefik
+# labels; the *.outsmartis.dev wildcard already resolves, so no DNS record is needed.
+services:
+  talkbawt:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      - SERVICE_FQDN_TALKBAWT_3000
+      - DB_PATH=/data/talkbawt.db
+      # BASE_URL is only needed if the public URL differs from the Host header
+      # Traefik forwards. Left unset, links are built from the forwarded host.
+      # - BASE_URL=https://talkbawt.outsmartis.dev
+    volumes:
+      - talkbawt-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  talkbawt-data:
