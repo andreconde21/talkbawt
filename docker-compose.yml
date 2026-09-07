@@ -6,6 +6,10 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    # Coolify reads `expose` to learn which port Traefik should send traffic to.
+    # Without it no loadbalancer.server.port label is emitted and the route 504s.
+    expose:
+      - "3000"
     environment:
       - SERVICE_FQDN_TALKBAWT_3000
       - DB_PATH=/data/talkbawt.db
