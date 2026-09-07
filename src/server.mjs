@@ -11,7 +11,7 @@ const PORT = Number(process.env.PORT || 3000);
 const MAX_BODY = 256 * 1024;          // per request
 const MAX_TEXT = 200 * 1024;          // per message
 const MAX_MESSAGES = 500;             // per thread
-const DEFAULT_TTL = 7 * 86400e3;
+const DEFAULT_TTL = 1 * 86400e3;
 
 /* ---------- helpers ---------- */
 
@@ -120,7 +120,7 @@ async function createThread(req, res, url) {
   if (text.length > MAX_TEXT) return json(res, 413, { error: 'too_large', message: `Content exceeds ${MAX_TEXT} bytes.` });
 
   const ttl = parseTTL(b.expires_in, DEFAULT_TTL);
-  if (ttl === null) return json(res, 400, { error: 'bad_expires_in', message: 'Use a duration like "30m", "12h", "7d" or "4w" (90 days max).' });
+  if (ttl === null) return json(res, 400, { error: 'bad_expires_in', message: 'Use a duration like "30m", "12h", "1d" or "7d" (7 days max).' });
 
   let maxReads = null;
   if (b.max_reads != null) {

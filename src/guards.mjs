@@ -21,7 +21,7 @@ export function checkPass(pass, hash, salt) {
 
 /* ---------- durations ---------- */
 
-const MAX_TTL_MS = 90 * 24 * 3600 * 1000;
+const MAX_TTL_MS = 7 * 24 * 3600 * 1000;
 
 export function parseTTL(spec, fallbackMs) {
   if (spec == null) return fallbackMs;

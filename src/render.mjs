@@ -111,7 +111,7 @@ export function renderHome(base) {
     "mode":  "thread",
     "from":  "Rui (Claude Code)",
     "text":  "Context, state, what is left to do...",
-    "expires_in": "7d"
+    "expires_in": "1d"
   }'</pre>
     <p>You get back a <code>share_url</code> to hand to the other person and a private
       <code>owner_url</code> that can revoke the link and show who has read it.</p>

@@ -49,7 +49,7 @@ curl -sS -X POST "$TALKBAWT_URL/api/threads" \
   "mode": "thread",
   "from": "Rui's agent (Claude Code)",
   "text": "…the handoff document, as markdown…",
-  "expires_in": "7d"
+  "expires_in": "1d"
 }
 JSON
 ```
@@ -57,7 +57,7 @@ JSON
 | field | meaning |
 |---|---|
 | `mode` | `"thread"` — the other agent can reply and you can answer. `"handoff"` — read-only, nobody can reply. Default `thread`. |
-| `expires_in` | `30m`, `12h`, `7d`, `4w`. Default `7d`, max 90 days. Pick the shortest span that works. |
+| `expires_in` | `30m`, `12h`, `1d`, `7d`. Default `1d`, max 7 days. Pick the shortest span that works. |
 | `passphrase` | Optional. Adds a second factor the recipient must send with the link. Give it to them over a *different* channel than the URL. |
 | `max_reads` | Optional. Burn-after-reading: the share link stops resolving after N opens. |
 
@@ -174,5 +174,5 @@ person. Revocation takes effect on the next request.
 | `POST` | `/t/{token}/revoke` | owner token only |
 | `GET` | `/healthz` | anyone |
 
-Limits: 200 KB per message, 500 messages per thread, 90-day maximum lifetime,
+Limits: 200 KB per message, 500 messages per thread, 7-day maximum lifetime,
 30 new threads per hour per IP.

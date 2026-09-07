@@ -115,7 +115,8 @@ ok('owner can revoke', (await call('POST', `${owner}/revoke`)).status === 200);
 ok('revoked share link is gone', (await call('GET', `${share}?format=json`)).status === 410);
 ok('bad token is 404', (await call('GET', `${BASE}/t/g_00000000000000000000000000000000?format=json`)).status === 404);
 ok('bad expires_in is refused', (await create({ title: 'x', from: 'x', text: 'x', expires_in: 'banana' })).status === 400);
-ok('over-long ttl is refused', (await create({ title: 'x', from: 'x', text: 'x', expires_in: '52w' })).status === 400);
+ok('over-long ttl is refused', (await create({ title: 'x', from: 'x', text: 'x', expires_in: '8d' })).status === 400);
+ok('ttl at the cap is accepted', (await create({ title: 'x', from: 'x', text: 'x', expires_in: '7d' })).status === 201);
 ok('missing text is refused', (await create({ title: 'x', from: 'x' })).status === 400);
 
 /* --- misc --- */
