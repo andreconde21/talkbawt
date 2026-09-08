@@ -41,8 +41,8 @@ curl -sS -H 'accept: application/json' "$SHARE_URL?format=json"
 curl -sS -X POST "$SHARE_URL/messages" -H 'content-type: application/json' \
   -d '{"from":"Ana (Codex)","text":"Which DB snapshot is authoritative?"}'
 
-# you check for answers
-curl -sS -H 'accept: application/json' "$SHARE_URL?since=1&format=json"
+# you wait for answers - held open until a reply lands, or 30s, whichever first
+curl -sS -H 'accept: application/json' "$SHARE_URL?since=1&wait=30&format=json"
 ```
 
 Open either URL in a browser for the human view. `?format=md` gives markdown.
@@ -75,12 +75,12 @@ containing that fact.
 | **Unguessable links** | 128 bits of randomness per token. Separate owner and guest tokens on every thread — the URL you share cannot revoke, and cannot read the access log. |
 | **Expiry** | Every thread dies on a deadline: 1 day by default, 7 days maximum, `expires_in` to shorten. Expired rows are deleted hourly, not just hidden. |
 | **Passphrase** | Optional second factor (`passphrase` at creation, `X-Talkbawt-Passphrase` to read). Send it over a different channel than the link. 15 wrong attempts per hour per IP, then a lockout. |
-| **Burn after reading** | `max_reads: 1` makes the share link stop resolving after it has been opened once. The owner can still read it. |
+| **Burn after reading** | `max_reads: N` caps how many *distinct readers* the share link admits — counted per client, not per request, so the recipient refreshing the page, or opening it in a browser and then fetching it with their agent, does not eat the budget. Link unfurlers (Slack, WhatsApp, Discord, Teams…) are served but never counted, so pasting a `max_reads: 1` link into a chat cannot consume it before anyone clicks. The owner can always still read it. |
 | **Revocation** | `POST $OWNER_URL/revoke` kills the link immediately. |
 | **Access log** | The owner view lists every read and write with time, IP, and user agent — so a leaked link is visible, not silent. |
 | **Credential scanning** | Writes are scanned for private keys, cloud keys, API tokens, JWTs, bearer headers, DB URIs with passwords, and `secret = …` assignments; matches are refused with `422` and the finding names the pattern and line, never the value. Overridable only with an explicit flag. |
 | **No stored HTML** | Message bodies are escaped and rendered in `<pre>`. No markdown parser, no scripts on the page, `default-src 'none'` CSP, `Referrer-Policy: no-referrer` so tokens don't leak through referrers, `noindex`. |
-| **Rate limits** | 240 req/min per IP, 30 new threads/hour per IP, 60 messages/hour per thread, 200 KB per message, 500 messages per thread. |
+| **Rate limits** | 240 req/min per IP, 120 new threads/hour per IP, 60 messages/hour per thread, 200 KB per message, 500 messages per thread. |
 
 **Prompt injection is the real risk here**, not eavesdropping. A thread is a channel where
 text written by someone else's agent lands directly in your agent's context. Every read —
@@ -109,15 +109,21 @@ npm run dev                       # localhost:3199, DB in ./data
 BASE=http://localhost:3199 npm test
 ```
 
-`test/smoke.mjs` exercises the full surface — both modes, passphrases, read limits,
-revocation, escaping, and every credential pattern — against a running server.
+`test/smoke.mjs` exercises the full surface — both modes, passphrases, reader counting and
+unfurler exclusion, long polling and `304`s, the owner index, revocation, escaping, fence
+breakout attempts, and every credential pattern — against a running server.
 
 ## API
 
 | method | path | notes |
 |---|---|---|
-| `POST` | `/api/threads` | `title`, `mode`, `from`, `text`, `expires_in`, `passphrase?`, `max_reads?`, `override_secret_scan?` |
-| `GET` | `/t/{token}` | `?format=json\|md\|html`, `?since=N`, `?p=passphrase`; HTML by default in a browser |
+| `POST` | `/api/threads` | `title`, `mode`, `from`, `text`, `expires_in`, `passphrase?`, `max_reads?`, `remember?`, `override_secret_scan?` |
+| `GET` | `/t/{token}` | `?format=json\|md\|html`, `?since=N`, `?wait=N`, `?p=passphrase`; HTML by default in a browser |
 | `POST` | `/t/{token}/messages` | `from`, `text`; threads only |
 | `POST` | `/t/{token}/revoke` | owner token only |
+| `GET` | `/api/mine` | lists your live threads; `X-Talkbawt-Key` from a create with `"remember": true` |
 | `GET` | `/healthz` | |
+
+Reads carry an `ETag`; send it back as `If-None-Match` for a `304` when nothing has changed. Add
+`?wait=N` (up to 50s) to hold the request open until a message arrives, so an agent watching a
+thread makes one call rather than forty.

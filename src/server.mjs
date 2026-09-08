@@ -2,6 +2,7 @@ import { createServer } from 'node:http';
 import * as store from './db.mjs';
 import {
   newToken, hashPass, checkPass, parseTTL, scanForSecrets, rateLimit,
+  isPreviewBot, clientHash, newCreatorKey, hashKey,
 } from './guards.mjs';
 import {
   renderThread, renderMarkdown, renderHome, SECURITY_NOTICE, REPLY_HELP,
@@ -12,6 +13,12 @@ const MAX_BODY = 256 * 1024;          // per request
 const MAX_TEXT = 200 * 1024;          // per message
 const MAX_MESSAGES = 500;             // per thread
 const DEFAULT_TTL = 1 * 86400e3;
+const MAX_WAIT = 50;                  // seconds a long poll may be held open
+const MAX_WAITERS = 100;              // concurrent held requests
+const POLL_MS = 500;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let waiters = 0;
 
 /* ---------- helpers ---------- */
 
@@ -39,10 +46,11 @@ function send(res, code, type, payload, extra = {}) {
 }
 const json = (res, code, obj, extra) =>
   send(res, code, 'application/json; charset=utf-8', JSON.stringify(obj, null, 2), extra);
-const html = (res, code, body) =>
+const html = (res, code, body, extra = {}) =>
   send(res, code, 'text/html; charset=utf-8', body, {
     'content-security-policy':
       "default-src 'none'; style-src 'unsafe-inline'; img-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+    ...extra,
   });
 
 function readBody(req) {
@@ -74,9 +82,12 @@ function resolveAccess(req, token, url) {
   const row = store.findByToken(token);
   if (!row) return { error: [404, { error: 'not_found', message: 'No such thread. The link may have been revoked or it may have expired.' }] };
 
-  const ctx = { ip: clientIP(req), ua: req.headers['user-agent'] };
+  const ip = clientIP(req);
+  const ua = req.headers['user-agent'] ?? '';
+  const ctx = { ip, ua, bot: isPreviewBot(ua), client: clientHash(ip, ua) };
+
   const deny = (code, body, note) => {
-    store.log(row.id, 'denied', { role: row.tok_role, ok: false, note, ...ctx });
+    store.log(row.id, 'denied', { role: row.tok_role, ok: false, ip, ua, note });
     return { error: [code, body] };
   };
 
@@ -87,7 +98,7 @@ function resolveAccess(req, token, url) {
     if (row.pass_hash) {
       const pass = (req.headers['x-talkbawt-passphrase'] ?? url.searchParams.get('p') ?? '').toString();
       if (!checkPass(pass, row.pass_hash, row.pass_salt)) {
-        const rl = rateLimit(`badpass:${ctx.ip}`, 15, 3600e3);
+        const rl = rateLimit(`badpass:${ip}`, 15, 3600e3);
         if (!rl.ok) return deny(429, { error: 'too_many_attempts', message: 'Too many failed passphrase attempts.' }, 'passphrase lockout');
         return deny(401, {
           error: 'passphrase_required',
@@ -95,8 +106,13 @@ function resolveAccess(req, token, url) {
         }, 'bad passphrase');
       }
     }
-    if (row.max_reads != null && row.guest_reads >= row.max_reads) {
-      return deny(410, { error: 'read_limit_reached', message: 'This link has already been opened the maximum number of times.' }, 'read limit');
+    // Burn-after-reading counts distinct readers rather than requests, and a
+    // link preview never counts: an unfurler must not be able to consume the
+    // recipient's only read before they have clicked anything.
+    if (row.max_reads != null && !ctx.bot
+        && !store.isKnownReader(row.id, ctx.client)
+        && store.countReaders(row.id) >= row.max_reads) {
+      return deny(410, { error: 'read_limit_reached', message: 'This link has already been opened by the maximum number of readers.' }, 'read limit');
     }
   }
 
@@ -107,7 +123,7 @@ function resolveAccess(req, token, url) {
 
 async function createThread(req, res, url) {
   const ip = clientIP(req);
-  if (!rateLimit(`create:${ip}`, 30, 3600e3).ok)
+  if (!rateLimit(`create:${ip}`, 120, 3600e3).ok)
     return json(res, 429, { error: 'rate_limited', message: 'Too many threads created from this address. Try again later.' });
 
   const b = await readBody(req);
@@ -144,9 +160,17 @@ async function createThread(req, res, url) {
       findings,
     });
 
+  // An optional creator key groups the threads one person made, so losing an
+  // owner_url does not mean losing the thread. Generated server-side, so it is
+  // never weak, returned once, and stored only as a hash.
+  const suppliedKey = str(b.creator_key, 200) || str(req.headers['x-talkbawt-key'], 200);
+  const issueKey = !suppliedKey && b.remember === true;
+  const creatorKey = suppliedKey || (issueKey ? newCreatorKey() : null);
+
   const id = store.createThread({
     title, mode, expiresAt: new Date(Date.now() + ttl).toISOString(),
     passHash: pass?.hash ?? null, passSalt: pass?.salt ?? null, maxReads,
+    creatorHash: creatorKey ? hashKey(creatorKey) : null,
   });
   const guest = newToken('g');
   const owner = newToken('o');
@@ -157,7 +181,7 @@ async function createThread(req, res, url) {
 
   const base = baseURL(req);
   const shareURL = `${base}/t/${guest}`;
-  return json(res, 201, {
+  const body = {
     ok: true,
     mode,
     title,
@@ -169,24 +193,93 @@ async function createThread(req, res, url) {
       `coding agent and ask it to fetch it.${pass ? ' It is passphrase-protected; I will send the passphrase separately.' : ''}`,
     keep_private: 'owner_url is yours alone: it revokes the link and shows who has read it. Never share it.',
     next_steps: mode === 'thread'
-      ? { watch_for_replies: `${shareURL}?since=1&format=json`, revoke: `POST ${base}/t/${owner}/revoke` }
+      ? { watch_for_replies: `${shareURL}?since=1&wait=30&format=json`, revoke: `POST ${base}/t/${owner}/revoke` }
       : { revoke: `POST ${base}/t/${owner}/revoke` },
+  };
+  if (creatorKey) body.your_threads = `${base}/api/mine`;
+  if (issueKey) {
+    body.creator_key = creatorKey;
+    body.keep_creator_key = 'Save this key. Send it as `X-Talkbawt-Key` when you create a thread ' +
+      'to add it to your list, and to GET /api/mine to list the threads you still have open. ' +
+      'It is shown once and stored only as a hash, so it cannot be recovered.';
+  }
+  return json(res, 201, body);
+}
+
+function listMine(req, res, url) {
+  if (!rateLimit(`mine:${clientIP(req)}`, 60, 3600e3).ok)
+    return json(res, 429, { error: 'rate_limited', message: 'Too many listings from this address. Try again later.' });
+
+  const key = str(req.headers['x-talkbawt-key'], 200) || str(url.searchParams.get('key'), 200);
+  if (!key) return json(res, 401, {
+    error: 'key_required',
+    message: 'Send your creator key as `X-Talkbawt-Key`. You get one by creating a thread with "remember": true.',
+  });
+
+  const base = baseURL(req);
+  const rows = store.threadsByCreator(hashKey(key));
+  return json(res, 200, {
+    count: rows.length,
+    note: 'Live threads you created with this key. Expired and revoked threads are not listed.',
+    threads: rows.map((t) => {
+      const toks = store.tokensFor(t.id);
+      const guest = toks.find((k) => k.role === 'guest' && !k.revoked);
+      const owner = toks.find((k) => k.role === 'owner');
+      return {
+        title: t.title,
+        mode: t.mode,
+        created_at: t.created_at,
+        expires_at: t.expires_at,
+        messages: store.maxSeq(t.id),
+        distinct_readers: store.countReaders(t.id),
+        max_reads: t.max_reads,
+        passphrase_required: Boolean(t.pass_hash),
+        share_url: guest ? `${base}/t/${guest.token}` : null,
+        owner_url: owner ? `${base}/t/${owner.token}` : null,
+      };
+    }),
   });
 }
 
-function showThread(req, res, url, access, token) {
+async function showThread(req, res, url, access, token) {
   const { thread, role, ctx } = access;
-  const since = Number(url.searchParams.get('since') ?? 0) || 0;
-  const messages = store.messagesSince(thread.id, since);
+  const since = Math.max(0, Number(url.searchParams.get('since') ?? 0) || 0);
   const fmt = url.searchParams.get('format');
   const base = baseURL(req);
 
-  if (role === 'guest') store.bumpReads(thread.id);
-  store.log(thread.id, 'read', { role, ...ctx });
+  // Long poll: hold the request open until something new lands, so an agent
+  // watching for a reply makes one call instead of forty.
+  const wait = Math.min(Math.max(Number(url.searchParams.get('wait') ?? 0) || 0, 0), MAX_WAIT);
+  if (wait > 0 && waiters < MAX_WAITERS && store.maxSeq(thread.id) <= since) {
+    waiters++;
+    try {
+      const deadline = Date.now() + wait * 1000;
+      while (store.maxSeq(thread.id) <= since && Date.now() < deadline) {
+        await sleep(POLL_MS);
+        if (req.destroyed || res.writableEnded) return;   // caller gave up
+      }
+    } finally { waiters--; }
+    const fresh = store.findByToken(token);
+    if (!fresh || fresh.revoked || fresh.tok_revoked)
+      return json(res, 410, { error: 'revoked', message: 'This link was revoked while you were waiting.' });
+  }
 
-  if (wantsHTML(req, fmt)) return html(res, 200, renderThread({ thread, messages, base, token, role }));
+  const messages = store.messagesSince(thread.id, since);
+
+  if (role === 'guest' && !ctx.bot) store.recordReader(thread.id, ctx.client);
+  store.log(thread.id, ctx.bot ? 'preview' : 'read', {
+    role, ip: ctx.ip, ua: ctx.ua, note: ctx.bot ? 'link preview, not counted as a read' : null,
+  });
+
+  // A poller holding the current version gets 304 and no body.
+  const etag = `W/"${thread.id}-${store.maxSeq(thread.id)}-${since}-${fmt ?? 'auto'}"`;
+  if ((req.headers['if-none-match'] ?? '') === etag)
+    return send(res, 304, 'text/plain; charset=utf-8', '', { etag });
+
+  if (wantsHTML(req, fmt))
+    return html(res, 200, renderThread({ thread, messages, base, token, role }), { etag });
   if (fmt === 'md' || fmt === 'markdown')
-    return send(res, 200, 'text/markdown; charset=utf-8', renderMarkdown({ thread, messages, base, token }));
+    return send(res, 200, 'text/markdown; charset=utf-8', renderMarkdown({ thread, messages, base, token }), { etag });
 
   const payload = {
     security_notice: SECURITY_NOTICE,
@@ -206,13 +299,13 @@ function showThread(req, res, url, access, token) {
   if (role === 'owner') {
     payload.owner = {
       share_url: `${base}/t/${store.tokensFor(thread.id).find((t) => t.role === 'guest' && !t.revoked)?.token ?? '(revoked)'}`,
-      guest_reads: thread.guest_reads,
+      distinct_readers: store.countReaders(thread.id),
       max_reads: thread.max_reads,
       revoke: `POST ${base}/t/${token}/revoke`,
       access_log: store.accessLog(thread.id),
     };
   }
-  return json(res, 200, payload);
+  return json(res, 200, payload, { etag });
 }
 
 async function postMessage(req, res, access, token) {
@@ -268,6 +361,7 @@ const server = createServer(async (req, res) => {
     if (path === '/robots.txt') return send(res, 200, 'text/plain', 'User-agent: *\nDisallow: /\n');
     if (path === '/' && req.method === 'GET') return html(res, 200, renderHome(baseURL(req)));
     if (path === '/api/threads' && req.method === 'POST') return await createThread(req, res, url);
+    if (path === '/api/mine' && req.method === 'GET') return listMine(req, res, url);
 
     const m = path.match(/^\/t\/([A-Za-z0-9_]{10,80})(\/messages|\/revoke)?$/);
     if (m) {
@@ -280,7 +374,7 @@ const server = createServer(async (req, res) => {
             `<h1>talkbawt</h1><div class="warn"><strong>${body.error.replace(/_/g, ' ')}</strong>${body.message}</div>`));
         return json(res, code, body);
       }
-      if (!sub && req.method === 'GET') return showThread(req, res, url, access, token);
+      if (!sub && req.method === 'GET') return await showThread(req, res, url, access, token);
       if (sub === '/messages' && req.method === 'POST') return await postMessage(req, res, access, token);
       if (sub === '/revoke' && req.method === 'POST') return revoke(req, res, access, token);
       return json(res, 405, { error: 'method_not_allowed' });

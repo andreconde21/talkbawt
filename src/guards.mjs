@@ -1,8 +1,34 @@
-import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes, createHash, scryptSync, timingSafeEqual } from 'node:crypto';
 
 /* ---------- tokens ---------- */
 
 export const newToken = (prefix) => `${prefix}_${randomBytes(16).toString('hex')}`;
+
+/* A per-response marker, so a message body cannot forge the fence that
+   separates untrusted content from our own text. See render.mjs. */
+export const newMarker = () => randomBytes(6).toString('hex');
+
+/* Creator keys group the threads one person made, for GET /api/mine.
+   Generated server-side so they are never weak, stored only as a hash. */
+export const newCreatorKey = () => `k_${randomBytes(24).toString('hex')}`;
+export const hashKey = (key) => createHash('sha256').update(String(key)).digest('hex');
+
+/* ---------- client identity ---------- */
+
+/* Distinct readers are counted per client, not per request, so refreshing a
+   page - or a browser and an agent on the same machine - does not burn a
+   max_reads budget. Salted per process start: these never need to outlive it,
+   and it keeps raw addresses out of the table. */
+const CLIENT_SALT = randomBytes(16).toString('hex');
+export const clientHash = (ip, ua) =>
+  createHash('sha256').update(`${CLIENT_SALT}|${ip}|${ua ?? ''}`).digest('hex').slice(0, 32);
+
+/* Link unfurlers fetch a URL the moment it is pasted into a chat. Counting
+   that as a read burns burn-after-reading links before the recipient ever
+   clicks, and fills the access log with arrivals nobody made. Serve them,
+   but do not count them. */
+const PREVIEW_BOTS = /slackbot|slack-imgproxy|discordbot|whatsapp|telegrambot|twitterbot|facebookexternalhit|facebot|linkedinbot|skypeuripreview|redditbot|embedly|quora link preview|outlook|teams|googlebot|bingbot|applebot|duckduckbot|yandexbot|baiduspider|semrushbot|ahrefsbot|preview|unfurl|link-?check|monitoring|uptime|pingdom|curl-preview/i;
+export const isPreviewBot = (ua) => PREVIEW_BOTS.test(String(ua ?? ''));
 
 /* ---------- passphrase ---------- */
 
