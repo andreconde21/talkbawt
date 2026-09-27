@@ -1,4 +1,6 @@
 /* End-to-end smoke test. Usage: BASE=http://localhost:3199 node test/smoke.mjs */
+import { createHmac } from 'node:crypto';
+
 const BASE = process.env.BASE || 'http://localhost:3199';
 
 let pass = 0, fail = 0;
@@ -199,6 +201,156 @@ const gone = mine.json.threads[0].owner_url;
 await call('POST', `${gone}/revoke`);
 ok('a revoked thread drops out of the listing',
    (await call('GET', `${BASE}/api/mine`, undefined, { 'x-talkbawt-key': KEY })).json.count === 1);
+
+/* --- revoke keeps the owner's access log --- */
+console.log('\nrevoked owner view');
+const rv = await create({ title: 'Revoke me', from: 'Rui', text: 'short-lived content' });
+await call('GET', `${rv.json.share_url}?format=json`);
+const rvRes = await call('POST', `${rv.json.owner_url}/revoke`);
+ok('revoke names the retention deadline', rvRes.status === 200 && typeof rvRes.json.retained_until === 'string');
+const rvOwner = await call('GET', `${rv.json.owner_url}?format=json`);
+ok('the owner URL still answers 410, so pollers stop', rvOwner.status === 410 && rvOwner.json.error === 'revoked');
+ok('but carries the access log', Array.isArray(rvOwner.json.owner?.access_log)
+   && rvOwner.json.owner.access_log.some((e) => e.action === 'revoked')
+   && rvOwner.json.owner.access_log.some((e) => e.action === 'read' && e.role === 'guest'));
+ok('and the retention deadline', rvOwner.json.thread?.retained_until === rvRes.json.retained_until);
+ok('and the reader count', rvOwner.json.owner.distinct_readers === 1);
+ok('the messages themselves are gone', !JSON.stringify(rvOwner.json).includes('short-lived content'));
+const rvHtml = await fetch(rv.json.owner_url, { headers: { accept: 'text/html' } });
+const rvHtmlBody = await rvHtml.text();
+ok('the HTML owner view shows the log too', rvHtml.status === 410 && rvHtmlBody.includes('Access log') && !rvHtmlBody.includes('short-lived content'));
+ok('readers stay blocked with 410', (await call('GET', `${rv.json.share_url}?format=json`)).status === 410);
+ok('the owner cannot post after revoking', (await call('POST', `${rv.json.owner_url}/messages`, { from: 'Rui', text: 'x' })).status === 410);
+ok('revoking twice is harmless', (await call('POST', `${rv.json.owner_url}/revoke`)).json?.already_revoked === true);
+ok('the live owner HTML view shows the access log', (await (await fetch(pol.json.owner_url, { headers: { accept: 'text/html' } })).text()).includes('Access log (owner only)'));
+
+/* --- max_reads visible before a read --- */
+console.log('\nread budget, before reading');
+const mr = await create({ title: 'Budgeted', from: 'Rui', text: 'two readers only', max_reads: 2 });
+const meta0 = await call('GET', `${mr.json.share_url}/meta`);
+ok('meta shows the budget', meta0.status === 200 && meta0.json.max_reads === 2 && meta0.json.reads_remaining === 2);
+ok('meta says a read would use one up', meta0.json.a_read_would_use_one_up === true && meta0.json.a_read_would_be_admitted === true);
+ok('meta did not count as a read', (await call('GET', `${mr.json.owner_url}?format=json`)).json.owner.distinct_readers === 0);
+const hd = await fetch(mr.json.share_url, { method: 'HEAD' });
+ok('HEAD carries the budget in headers', hd.status === 200 && hd.headers.get('x-talkbawt-reads-remaining') === '2'
+   && hd.headers.get('x-talkbawt-max-reads') === '2');
+await call('GET', `${mr.json.share_url}?format=json`);
+const meta1 = await call('GET', `${mr.json.share_url}/meta`);
+ok('after a read, one is left and you are counted', meta1.json.reads_remaining === 1 && meta1.json.you_are_already_counted === true
+   && meta1.json.a_read_would_use_one_up === false);
+await fetch(`${mr.json.share_url}?format=json`, { headers: { accept: 'application/json', 'user-agent': 'second reader' } });
+const meta2 = await fetch(`${mr.json.share_url}/meta`, { headers: { accept: 'application/json', 'user-agent': 'third reader' } }).then((r) => r.json());
+ok('a new client sees it would be refused, without being refused', meta2.reads_remaining === 0 && meta2.a_read_would_be_admitted === false);
+const guestRead = await call('GET', `${mr.json.share_url}?format=json`);
+ok('reads carry the remaining budget too', guestRead.json.thread.reads_remaining === 0 && guestRead.json.thread.max_reads === 2);
+ok('meta is logged for the owner as a check', (await call('GET', `${mr.json.owner_url}?format=json`)).json.owner.access_log.some((e) => e.action === 'checked'));
+const pm = await create({ title: 'Secret title', from: 'Rui', text: 'x', passphrase: 'correct horse battery', max_reads: 1 });
+const pmMeta = await call('GET', `${pm.json.share_url}/meta`);
+ok('meta without the passphrase shows the budget but not the title',
+   pmMeta.status === 200 && pmMeta.json.passphrase_required === true && pmMeta.json.reads_remaining === 1 && pmMeta.json.title === undefined);
+ok('meta with a wrong passphrase is refused', (await call('GET', `${pm.json.share_url}/meta`, undefined, { 'x-talkbawt-passphrase': 'nope' })).status === 401);
+ok('meta with the passphrase shows the title',
+   (await call('GET', `${pm.json.share_url}/meta`, undefined, { 'x-talkbawt-passphrase': 'correct horse battery' })).json.title === 'Secret title');
+ok('meta on a revoked link is 410', (await call('GET', `${rv.json.share_url}/meta`)).status === 410);
+
+/* --- signed from --- */
+console.log('\nsigned messages');
+const sign = (key, raw, t = Math.floor(Date.now() / 1000)) =>
+  `t=${t},v1=${createHmac('sha256', key).update(`${t}.${raw}`).digest('hex')}`;
+const postSigned = async (url, obj, key, t) => {
+  const raw = JSON.stringify(obj);
+  const sig = sign(key, raw, t);
+  const res = await fetch(`${url}/messages`, { method: 'POST', body: raw, headers: {
+    'content-type': 'application/json', accept: 'application/json', 'x-talkbawt-signature': sig } });
+  return { status: res.status, json: await res.json(), raw, sig };
+};
+const sg = await create({ title: 'Signed', from: 'Rui', text: 'signed thread', signing: true });
+ok('signing issues two participant keys', sg.json.signing?.owner_key?.startsWith('sk_o_') && sg.json.signing?.guest_key?.startsWith('sk_g_'));
+const G = sg.json.signing.guest_key, O = sg.json.signing.owner_key;
+const sgPost = await postSigned(sg.json.share_url, { from: 'Ana (Codex)', text: 'signed reply' }, G);
+ok('a guest-signed post is accepted as verified', sgPost.status === 201 && sgPost.json.verified === true && sgPost.json.signed_by === 'guest');
+ok('an unsigned post still works', (await call('POST', `${sg.json.share_url}/messages`, { from: 'Ana (Codex)', text: 'unsigned' })).status === 201);
+const sgOwnerPost = await postSigned(sg.json.share_url, { from: 'Rui', text: 'owner key via the share link' }, O);
+ok('the signer is the key, not the link', sgOwnerPost.json.signed_by === 'owner');
+const sgRead = await call('GET', `${sg.json.share_url}?format=json`);
+const byText = (t) => sgRead.json.messages.find((m) => m.untrusted_content === t);
+ok('the creation message is owner-verified', sgRead.json.messages[0].verified === true && sgRead.json.messages[0].signed_by === 'owner');
+ok('reads mark signed messages verified', byText('signed reply')?.verified === true && byText('signed reply')?.signed_by === 'guest');
+ok('and unsigned ones unverified', byText('unsigned')?.verified === false && byText('unsigned')?.signed_by === null);
+ok('reads say signing is on', sgRead.json.thread.signing === 'optional' && sgRead.json.how_to_reply.signing?.header);
+const replay = await fetch(`${sg.json.share_url}/messages`, { method: 'POST', body: sgPost.raw, headers: {
+  'content-type': 'application/json', 'x-talkbawt-signature': sgPost.sig } });
+ok('a replayed signed message is refused', replay.status === 409, `got ${replay.status}`);
+const tampered = await fetch(`${sg.json.share_url}/messages`, { method: 'POST',
+  body: JSON.stringify({ from: 'Ana (Codex)', text: 'changed after signing' }),
+  headers: { 'content-type': 'application/json', 'x-talkbawt-signature': sign(G, sgPost.raw) } });
+ok('a signature over a different body is refused', tampered.status === 401);
+ok('a key from another thread is refused', (await postSigned(sg.json.share_url, { from: 'x', text: 'y' }, 'sk_g_' + '0'.repeat(48))).status === 401);
+ok('a stale timestamp is refused', (await postSigned(sg.json.share_url, { from: 'x', text: 'old' }, G, Math.floor(Date.now() / 1000) - 3600)).status === 401);
+ok('a malformed signature header is refused', (await call('POST', `${sg.json.share_url}/messages`, { from: 'x', text: 'y' }, { 'x-talkbawt-signature': 'nonsense' })).status === 400);
+const sgMd = await call('GET', `${sg.json.share_url}?format=md`);
+ok('markdown labels verified and unverified', sgMd.text.includes('[verified: signed with the guest key]') && sgMd.text.includes('[unverified: not signed]'));
+const sgHtml = await (await fetch(sg.json.share_url, { headers: { accept: 'text/html' } })).text();
+ok('HTML shows the badges', sgHtml.includes('verified guest') && sgHtml.includes('>unverified<'));
+const req = await create({ title: 'Signed only', from: 'Rui', text: 'x', signing: 'required' });
+ok('a required-signing thread refuses unsigned posts', (await call('POST', `${req.json.share_url}/messages`, { from: 'x', text: 'y' })).status === 401);
+ok('and accepts signed ones', (await postSigned(req.json.share_url, { from: 'Ana', text: 'signed' }, req.json.signing.guest_key)).status === 201);
+ok('an unsigned thread refuses a signature header', (await postSigned(pol.json.share_url, { from: 'x', text: 'y' }, G)).status === 400);
+ok('a bad signing value is refused', (await create({ title: 'x', from: 'x', text: 'x', signing: 'sometimes' })).status === 400);
+
+/* --- watching many threads in one request --- */
+console.log('\nwatch');
+const w1 = await create({ title: 'Watch one', from: 'Rui', text: 'first' });
+const w2 = await create({ title: 'Watch two', from: 'Rui', text: 'second' });
+const w3 = await create({ title: 'Watch three', from: 'Rui', text: 'third' });
+const watchBody = (wait) => ({ wait, threads: [
+  { id: 'one', token: w1.json.owner_url, since: 1, readers: 0 },
+  { id: 'two', token: w2.json.owner_url.split('/t/')[1], since: 1, readers: 0 },
+  { id: 'three', token: w3.json.owner_url, since: 1, readers: 0 },
+] });
+const wIdle0 = Date.now();
+const wIdle = await call('POST', `${BASE}/api/watch`, watchBody(2));
+ok('an idle watch is held open', Date.now() - wIdle0 >= 1800, `returned after ${Date.now() - wIdle0}ms`);
+ok('and then reports nothing changed', wIdle.status === 200 && wIdle.json.changed === 0 && wIdle.json.threads.length === 3);
+ok('each entry comes back in order, with its id', wIdle.json.threads.map((t) => t.id).join() === 'one,two,three'
+   && wIdle.json.threads.every((t) => t.state === 'live' && t.last_seq === 1));
+ok('a watch carries the security notice', /UNTRUSTED CONTENT/.test(wIdle.json.security_notice));
+const wStart = Date.now();
+const [wWoke] = await Promise.all([
+  call('POST', `${BASE}/api/watch`, watchBody(20)),
+  (async () => { await new Promise((r) => setTimeout(r, 1200));
+                 return call('POST', `${w2.json.share_url}/messages`, { from: 'Ana', text: 'reply on two' }); })(),
+]);
+ok('a watch wakes as soon as any thread gets a reply', Date.now() - wStart < 8000 && wWoke.json.changed === 1, `after ${Date.now() - wStart}ms`);
+const two = wWoke.json.threads.find((t) => t.id === 'two');
+ok('and carries that reply', two.changed && two.new_messages.length === 1 && two.new_messages[0].untrusted_content === 'reply on two'
+   && two.new_messages[0].verified === false);
+ok('the other threads are unchanged', wWoke.json.threads.filter((t) => t.id !== 'two').every((t) => !t.changed && t.new_messages.length === 0));
+const [wRead] = await Promise.all([
+  call('POST', `${BASE}/api/watch`, { wait: 20, threads: [{ token: w1.json.owner_url, since: 1, readers: 0 }] }),
+  (async () => { await new Promise((r) => setTimeout(r, 1000)); return call('GET', `${w1.json.share_url}?format=json`); })(),
+]);
+ok('a new reader wakes a watch too', wRead.json.threads[0].readers_changed === true && wRead.json.threads[0].distinct_readers === 1);
+await call('POST', `${w3.json.owner_url}/revoke`);
+const wGone = await call('POST', `${BASE}/api/watch`, watchBody(0));
+ok('a revoked thread reports its state', wGone.json.threads.find((t) => t.id === 'three').state === 'revoked');
+const wGuest = await call('POST', `${BASE}/api/watch`, { threads: [{ token: w1.json.share_url, since: 0 }] });
+ok('share tokens cannot watch', wGuest.json.threads[0].state === 'owner_only' && !wGuest.json.threads[0].new_messages);
+ok('unknown tokens report not_found', (await call('POST', `${BASE}/api/watch`, { threads: [{ token: 'o_00000000000000000000000000000000', since: 0 }] })).json.threads[0].state === 'not_found');
+ok('an empty list is refused', (await call('POST', `${BASE}/api/watch`, { threads: [] })).status === 400);
+ok('too many threads are refused', (await call('POST', `${BASE}/api/watch`, { threads: Array.from({ length: 51 }, () => ({ token: w1.json.owner_url })) })).status === 400);
+ok('GET is not a watch (tokens stay out of URLs)', (await call('GET', `${BASE}/api/watch`)).status === 404);
+
+/* --- recovery through the creator key --- */
+console.log('\nrecovery');
+const rk = await create({ title: 'Recover me', from: 'Rui', text: 'x', remember: true });
+const RK = rk.json.creator_key;
+const rkLive = await call('GET', `${BASE}/api/mine`, undefined, { 'x-talkbawt-key': RK });
+ok('a lost owner URL comes back from /api/mine', rkLive.json.threads[0].owner_url === rk.json.owner_url && rkLive.json.threads[0].state === 'live');
+await call('POST', `${rk.json.owner_url}/revoke`);
+const rkAll = await call('GET', `${BASE}/api/mine?include=revoked`, undefined, { 'x-talkbawt-key': RK });
+ok('?include=revoked lists revoked threads still in retention', rkAll.json.count === 1 && rkAll.json.threads[0].state === 'revoked'
+   && rkAll.json.threads[0].share_url === null && rkAll.json.threads[0].owner_url === rk.json.owner_url);
 
 /* --- misc --- */
 console.log('\nmisc');
