@@ -1,4 +1,4 @@
-import { randomBytes, createHash, scryptSync, timingSafeEqual } from 'node:crypto';
+import { randomBytes, createHash, createHmac, scryptSync, timingSafeEqual } from 'node:crypto';
 
 /* ---------- tokens ---------- */
 
@@ -12,6 +12,37 @@ export const newMarker = () => randomBytes(6).toString('hex');
    Generated server-side so they are never weak, stored only as a hash. */
 export const newCreatorKey = () => `k_${randomBytes(24).toString('hex')}`;
 export const hashKey = (key) => createHash('sha256').update(String(key)).digest('hex');
+
+/* ---------- signed messages ----------
+   Optional per-thread HMAC keys, one per participant, returned once at creation.
+   A post carrying `X-Talkbawt-Signature: t=<unix seconds>,v1=<hex>` where v1 is
+   HMAC-SHA256(key, "<t>.<raw request body>") is marked as signed by whichever
+   participant's key matches. The timestamp bounds replays to a window, and the
+   store refuses a signature it has already seen. */
+export const newSignKey = (role) => `sk_${role[0]}_${randomBytes(24).toString('hex')}`;
+export const SIGNATURE_WINDOW_S = 300;
+
+export const signBody = (key, t, raw) =>
+  createHmac('sha256', key).update(`${t}.${raw}`).digest('hex');
+
+export function parseSignature(header) {
+  const parts = Object.fromEntries(String(header ?? '').split(',')
+    .map((p) => p.trim().split('=')).filter((kv) => kv.length === 2));
+  const t = Number(parts.t);
+  if (!Number.isInteger(t) || !/^[0-9a-f]{64}$/.test(parts.v1 ?? '')) return null;
+  return { t, v1: parts.v1 };
+}
+
+/* Which of the given keys signed this body, or null. Constant-time per key. */
+export function verifySignature(sig, raw, keys) {
+  const got = Buffer.from(sig.v1, 'hex');
+  for (const [who, key] of Object.entries(keys)) {
+    if (!key) continue;
+    const want = Buffer.from(signBody(key, sig.t, raw), 'hex');
+    if (want.length === got.length && timingSafeEqual(want, got)) return who;
+  }
+  return null;
+}
 
 /* ---------- client identity ---------- */
 
@@ -92,27 +123,35 @@ export function scanForSecrets(text) {
   return findings;
 }
 
-/* ---------- rate limiting (in-memory sliding window) ---------- */
+/* ---------- rate limiting (in-memory sliding window) ----------
+   One limiter per server instance, so an embedded server keeps its own
+   buckets and its sweep timer stops when it closes. */
 
-const buckets = new Map();
+export function makeRateLimiter() {
+  const buckets = new Map();
 
-export function rateLimit(key, limit, windowMs) {
-  const now = Date.now();
-  const hits = (buckets.get(key) ?? []).filter((t) => now - t < windowMs);
-  if (hits.length >= limit) {
+  const limit = (key, max, windowMs) => {
+    const now = Date.now();
+    const hits = (buckets.get(key) ?? []).filter((t) => now - t < windowMs);
+    if (hits.length >= max) {
+      buckets.set(key, hits);
+      return { ok: false, retryAfter: Math.ceil((windowMs - (now - hits[0])) / 1000) };
+    }
+    hits.push(now);
     buckets.set(key, hits);
-    return { ok: false, retryAfter: Math.ceil((windowMs - (now - hits[0])) / 1000) };
-  }
-  hits.push(now);
-  buckets.set(key, hits);
-  return { ok: true };
-}
+    return { ok: true };
+  };
 
-setInterval(() => {
-  const cutoff = Date.now() - 3600e3;
-  for (const [k, v] of buckets) {
-    const kept = v.filter((t) => t > cutoff);
-    if (kept.length) buckets.set(k, kept);
-    else buckets.delete(k);
-  }
-}, 600e3).unref();
+  const timer = setInterval(() => {
+    const cutoff = Date.now() - 3600e3;
+    for (const [k, v] of buckets) {
+      const kept = v.filter((t) => t > cutoff);
+      if (kept.length) buckets.set(k, kept);
+      else buckets.delete(k);
+    }
+  }, 600e3);
+  timer.unref();
+
+  limit.stop = () => clearInterval(timer);
+  return limit;
+}
