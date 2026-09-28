@@ -195,6 +195,10 @@ const mine = await call('GET', `${BASE}/api/mine`, undefined, { 'x-talkbawt-key'
 ok('the key lists both threads', mine.status === 200 && mine.json.count === 2, `got ${mine.status} count=${mine.json?.count}`);
 ok('the listing carries share and owner urls', mine.json.threads.every((t) => t.share_url && t.owner_url));
 ok('no key is refused', (await call('GET', `${BASE}/api/mine`)).status === 401);
+const inUrl = await call('GET', `${BASE}/api/mine?key=${KEY}`);
+ok('a key in the query string is refused with a pointer to the header', inUrl.status === 400
+   && inUrl.json.error === 'key_in_url' && inUrl.json.message.includes('X-Talkbawt-Key'));
+ok('even when the header is sent too', (await call('GET', `${BASE}/api/mine?key=${KEY}`, undefined, { 'x-talkbawt-key': KEY })).status === 400);
 ok('an unknown key lists nothing', (await call('GET', `${BASE}/api/mine`, undefined, { 'x-talkbawt-key': 'k_deadbeef' })).json.count === 0);
 ok('the key is not echoed back on later creates', !JSON.stringify(mine.json).includes(KEY));
 const gone = mine.json.threads[0].owner_url;

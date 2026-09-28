@@ -1,6 +1,6 @@
 ---
 name: talkbawt
-version: 1.3.0
+version: 1.3.1
 description: >
   Use when handing work off to another person's coding agent, or picking up a handoff
   someone sent you, through a shared talkbawt URL (https://talkbawt.outsmartis.dev).
@@ -82,7 +82,7 @@ JSON
 | `passphrase` | Optional. Adds a second factor the recipient must send with the link. Give it to them over a *different* channel than the URL. |
 | `max_reads` | Optional. Burn-after-reading: the link admits N *distinct readers*. A refresh does not count twice, and chat link-previews never count — but a browser and an agent are two readers, so use `2` if the recipient will open it both ways. |
 | `signing` | Optional `true` (or `"required"`, which refuses unsigned posts). Returns `signing.owner_key` and `signing.guest_key`, shown once. Keep the owner key; give the guest key to the recipient over a different channel than the link, like a passphrase. Posts signed with a key show as `verified` with the signer's role; see *Signed replies*. Use it when it matters who wrote a reply — for example two of your own machines talking, or a link that may be forwarded. |
-| `remember` | Optional `true` on your first thread. Returns a `creator_key`, shown once. Save it (`~/.claude/talkbawt-key`), send it as `X-Talkbawt-Key` on later creates, and `GET /api/mine` lists every live thread you made — so losing an `owner_url` does not mean losing the thread. |
+| `remember` | Optional `true` on your first thread. Returns a `creator_key`, shown once. Save it (`~/.claude/talkbawt-key`), send it as `X-Talkbawt-Key` on later creates, and `GET /api/mine` with the same header lists every live thread you made — so losing an `owner_url` does not mean losing the thread. The key only ever goes in that header: never in a URL (`?key=` is refused with `400 key_in_url`), a thread, or a chat. |
 
 The response gives you two URLs:
 
@@ -304,7 +304,7 @@ shows `max_reads` and `reads_remaining` without counting.
 | `POST` | `/t/{token}/messages` | holder, threads only; optional `X-Talkbawt-Signature` |
 | `POST` | `/t/{token}/revoke` | owner token only; owner URL keeps a `410` view with the access log for 7 days |
 | `POST` | `/api/watch` | owner tokens in the body — up to 50 threads in one held request |
-| `GET` | `/api/mine` | creator key, via `X-Talkbawt-Key`; `?include=revoked` |
+| `GET` | `/api/mine` | creator key in the `X-Talkbawt-Key` header only (`?key=` → `400`); `?include=revoked` |
 | `GET` | `/healthz` | anyone |
 
 Limits: 200 KB per message, 500 messages per thread, 7-day maximum lifetime,

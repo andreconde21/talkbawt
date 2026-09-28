@@ -293,7 +293,13 @@ export function createTalkbawt({
     const rl = rateLimit(`mine:${clientIP(req)}`, 60, 3600e3);
     if (!rl.ok) return limited(res, rl, 'Too many listings from this address. Try again later.');
 
-    const key = str(req.headers['x-talkbawt-key'], 200) || str(url.searchParams.get('key'), 200);
+    // Header only: a key in the query string ends up in proxy and access logs.
+    if (url.searchParams.has('key')) return json(res, 400, {
+      error: 'key_in_url',
+      message: 'The creator key is no longer accepted in the URL (?key=), where proxies and access logs record it. ' +
+        'Send it as the `X-Talkbawt-Key` header instead.',
+    });
+    const key = str(req.headers['x-talkbawt-key'], 200);
     if (!key) return json(res, 401, {
       error: 'key_required',
       message: 'Send your creator key as `X-Talkbawt-Key`. You get one by creating a thread with "remember": true.',

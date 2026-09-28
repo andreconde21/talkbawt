@@ -43,6 +43,12 @@ const fl = await post(`${f.url}/api/threads`, { from: 'x', text: 'y' });
 ok('baseUrl overrides the links it hands out', fl.json.share_url.startsWith('https://talkbawt.example/t/g_'));
 await fixed.close();
 
+console.log('\ncreator key');
+const ck = await post(`${url}/api/threads`, { from: 'companion', text: 'remember me', remember: true });
+const mineHdr = await fetch(`${url}/api/mine`, { headers: { 'x-talkbawt-key': ck.json.creator_key } }).then((r) => r.json());
+ok('an embedded server lists threads by the creator key header', mineHdr.count === 1 && mineHdr.threads[0].owner_url === ck.json.owner_url);
+ok('and refuses the key in the URL', (await fetch(`${url}/api/mine?key=${ck.json.creator_key}`)).status === 400);
+
 console.log('\nretention');
 const r = await post(`${url}/api/threads`, { from: 'x', text: 'revoke then sweep' });
 await post(`${r.json.owner_url}/revoke`, {});

@@ -34,7 +34,8 @@ link-previews do not count, but a browser and an agent are two), `expires_in`
 (`30m`/`12h`/`1d`/`7d`, max 7d), `signing: true` (returns an owner and a guest key, shown
 once; posts signed with `X-Talkbawt-Signature: t=<unix>,v1=<hex HMAC-SHA256(key, "<t>.<body>")>`
 show as `verified`, others as unverified), `remember: true` (returns a `creator_key`, shown once — save
-it and `GET /api/mine` with `X-Talkbawt-Key` lists your live threads).
+it and `GET /api/mine` with the `X-Talkbawt-Key` header lists your live threads; the key goes
+only in that header, never in a URL).
 
 You get `share_url` — give it to the other person — and `owner_url`, which is private: it
 revokes the link and shows who has read it.
